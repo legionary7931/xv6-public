@@ -12,6 +12,21 @@ struct {
   struct proc proc[NPROC];
 } ptable;
 
+uint total_weight;
+uint vruntime_limit = 2147483647;//21 4748 3647
+
+int weight[40] = 
+{
+/*  0  */ 88761,  71755,  56483,  46273,  36291,
+/*  5  */ 29154,  23254,  18705,  14949,  11916,
+/*  10 */ 9548,   7620,   6100,   4904,   3906,
+/*  15 */ 3121,   2501,   1991,   1586,   1277,
+/*  20 */ 1024,   820,    655,    526,    423,
+/*  25 */ 335,    272,    215,    172,    137,
+/*  30 */ 110,    87,     70,     56,     45,
+/*  35 */ 36,     29,     23,     18,     15
+};
+
 static struct proc *initproc;
 
 int nextpid = 1;
@@ -88,6 +103,13 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->nice = 20;
+  p->weight = 1024;
+  p->start = ticks;
+  p->runtime = 0;
+  p->vrunIndex = 0;
+  p->progress = 0;
+  p->vruntime = 0;
 
   release(&ptable.lock);
 
@@ -198,7 +220,10 @@ fork(void)
   }
   np->sz = curproc->sz;
   np->parent = curproc;
+  np->vruntime = curproc->vruntime;
+  np->vrunIndex = curproc->vrunIndex;
   *np->tf = *curproc->tf;
+  //cprintf("parent: %d vrun: %d child: %d vrun: %d\n", curproc->pid, curproc->vruntime[0], np->pid, np->vruntime[0]);
 
   // Clear %eax so that fork returns 0 in the child.
   np->tf->eax = 0;
@@ -241,7 +266,7 @@ exit(void)
       curproc->ofile[fd] = 0;
     }
   }
-
+  
   begin_op();
   iput(curproc->cwd);
   end_op();
@@ -260,7 +285,20 @@ exit(void)
         wakeup1(initproc);
     }
   }
-
+  
+  curproc->runtime += curproc->progress;
+  int flag = 0; int remind = 0, temp;
+  if(curproc->vruntime + curproc->progress * 1024 / curproc->weight < 0) flag = 1;
+  if(flag){
+    temp = curproc->vruntime - vruntime_limit;
+    remind = temp + curproc->progress * 1024 / curproc->weight;
+    curproc->vrunIndex++;
+    curproc->vruntime = remind;
+  }
+  else curproc->vruntime += curproc->progress * 1024 / curproc->weight;
+  curproc->progress = 0;
+  //cprintf("%d exit vruntime %d\n", curproc->pid, curproc->vruntime[0]);
+  total_weight = 0;
   // Jump into the scheduler, never to return.
   curproc->state = ZOMBIE;
   sched();
@@ -323,32 +361,48 @@ void
 scheduler(void)
 {
   struct proc *p;
+  struct proc *min;
   struct cpu *c = mycpu();
+
   c->proc = 0;
-  
+
   for(;;){
     // Enable interrupts on this processor.
     sti();
+    
+    total_weight = 0;
 
-    // Loop over process table looking for process to run.
     acquire(&ptable.lock);
+    // Loop over process table looking for process to run.
     for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
-        continue;
+      if(p->state != RUNNABLE) continue;
+      min = p;
 
+      for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+        if(p->state == RUNNABLE) total_weight += weight[p->nice];
+        if(p->state == RUNNABLE && p->vrunIndex <= min->vrunIndex) {
+          if(p->vruntime < min->vruntime) min = p;
+        }
+      }
+      p = min;
+      
       // Switch to chosen process.  It is the process's job
       // to release ptable.lock and then reacquire it
       // before jumping back to us.
+      
       c->proc = p;
       switchuvm(p);
-      p->state = RUNNING;
 
+      p->state = RUNNING;
+      p->allocated = 10000 * p->weight / total_weight; // total timeslice: 10000 militicks
+
+      //cprintf("weight: %d total: %d pid: %d vruntime: %d ticks: %d allocated: %d\n", p->weight, total_weight, p->pid, p->vruntime, p->progress, p->allocated);
       swtch(&(c->scheduler), p->context);
       switchkvm();
-
       // Process is done running for now.
       // It should have changed its p->state before coming back.
       c->proc = 0;
+      
     }
     release(&ptable.lock);
 
@@ -386,6 +440,19 @@ void
 yield(void)
 {
   acquire(&ptable.lock);  //DOC: yieldlock
+  myproc()->runtime += myproc()->progress;
+  int flag = 0; int remind = 0, temp;
+  if(vruntime_limit - myproc()->vruntime < myproc()->progress * 1024 / myproc()->weight) flag = 1;
+  if(flag){
+    temp = myproc()->vruntime - vruntime_limit;
+    remind = temp + myproc()->progress * 1024 / myproc()->weight;
+    myproc()->vrunIndex++;
+    myproc()->vruntime = remind;
+  }
+  else myproc()->vruntime += myproc()->progress * 1024 / myproc()->weight;
+  myproc()->progress = 0;
+  //cprintf("%d yield vruntime: %d index: %d\n", myproc()->pid, myproc()->vruntime[myproc()->vrunIndex], myproc()->vrunIndex);
+  total_weight = 0;
   myproc()->state = RUNNABLE;
   sched();
   release(&ptable.lock);
@@ -435,6 +502,19 @@ sleep(void *chan, struct spinlock *lk)
     acquire(&ptable.lock);  //DOC: sleeplock1
     release(lk);
   }
+  p->runtime += p->progress;
+  int flag = 0; int remind = 0, temp;
+  if(vruntime_limit - p->vruntime < p->progress * 1024 / p->weight) flag = 1;
+  if(flag){
+    temp = p->vruntime - vruntime_limit;
+    remind = temp + p->progress * 1024 / p->weight;
+    p->vrunIndex++;
+    p->vruntime = remind;
+  }
+  else p->vruntime += p->progress * 1024 / p->weight;
+  p->progress = 0;
+  //cprintf("%d sleep vruntime: %d\n", p->pid, p->vruntime[0]);
+  total_weight = 0;
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
@@ -458,10 +538,34 @@ static void
 wakeup1(void *chan)
 {
   struct proc *p;
+  uint min=0, minindex = 0;
 
-  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++)
-    if(p->state == SLEEPING && p->chan == chan)
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == RUNNABLE) {
+      minindex = p->vrunIndex;
+      break;
+    }
+  }
+  
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == RUNNABLE){
+      if(p->vrunIndex < minindex){
+        minindex = p->vrunIndex;
+        min = p->vruntime;
+      }
+    }
+  }
+
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->state == SLEEPING && p->chan == chan){
       p->state = RUNNABLE;
+      p->parse = ticks;
+      p->vrunIndex = minindex;
+      p->vruntime = min;
+    }
+  }
+
+
 }
 
 // Wake up all processes sleeping on chan.
@@ -531,4 +635,166 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+int getnice(int pid){
+  struct proc *p;
+  int result;
+
+  acquire(&ptable.lock);
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->pid == pid){
+      result = p->nice;
+      release(&ptable.lock);
+      return result;
+    }
+  }
+  release(&ptable.lock);
+  return -1;
+}
+
+int setnice(int pid, int value){
+  struct proc *p;
+  if(value < 0 || value > 39) return -1;
+  acquire(&ptable.lock);
+  for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+    if(p->pid == pid){
+      p->nice = value;
+      //p->weight = 1; // for overflow testing
+      p->weight = weight[value];
+      release(&ptable.lock);
+      return 0;
+    }
+  }
+  release(&ptable.lock);
+  return -1;
+}
+
+void padding1(int length, int num){
+  int i, digit=1, temp;
+  for(i=0, temp=num; temp >= 10; temp /= 10, digit++);
+  for(i=0; i < length - digit; i++) cprintf(" ");
+}
+
+void padding3(int length, struct proc *p){
+  int i = 0, digit = 10, j;
+  int temp;
+  int carry, cur = 1, next = 0;
+  int max[10]= {2, 1, 4, 7, 4, 8, 3, 6, 4, 7};
+  //cprintf("pass\n");
+  while(i<10){
+    carry = 0;
+    if(i>=1) cur *= 10;
+    for(j=0; j<p->vrunIndex; j++)
+      carry += max[9-i];
+    if(i<9)
+      carry += (p->vruntime - ((p->vruntime / (cur * 10)) * cur * 10)) / cur;
+    else if(i==9) carry += p->vruntime / 1000000000;
+
+    carry += next;
+    next = carry / 10;
+    i++;
+  }
+  if(next>=1) digit++;
+  for(i=0, temp = next; temp>=10; temp/=10, digit++);
+  
+  //cprintf("\ndigit: %d\n", digit);
+  // for(i=0; i<=p->vrunIndex; i++){
+  //   cprintf("%d\n", p->vruntime[i]);
+  // }
+  cur = 1, i = 0;
+  
+  int output[20] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  
+  while(i<=digit){
+    carry = 0;
+    if(i>=1) cur *= 10;
+    for(j=0; j<p->vrunIndex; j++)
+      carry += max[9-i];
+    if(i<9)
+      carry += (p->vruntime - ((p->vruntime / (cur * 10)) * cur * 10)) / cur;
+    else if(i==9) carry += p->vruntime / 1000000000;
+
+    carry += next;
+    output[i] = carry%10;
+    next = carry / 10;
+    i++;
+  }
+
+  //cprintf("%d\n", digit);
+  for(i=21-digit; i<=20; i++){
+    cprintf("%d", output[20 - i]);
+  }
+}
+
+void padding2(int length, char* s){
+  int i, size = 0;
+  char temp;
+  for(i=0; (temp = s[i])!='\0'; i++, size++);
+  for(i=0; i<length - size; i++) cprintf(" ");
+}
+
+void ps(int pid){
+  struct proc *p;
+  static char *states[] = {
+  [UNUSED]    "UNUSED",
+  [EMBRYO]    "EMBRYO",
+  [SLEEPING]  "SLEEPING",
+  [RUNNABLE]  "RUNNABLE",
+  [RUNNING]   "RUNNING",
+  [ZOMBIE]    "ZOMBIE"
+  };
+
+  acquire(&ptable.lock);
+  cprintf("name      pid       state      priority       runtime/weight   runtime        vruntime            tick %d\n", ticks*1000);
+          //10       10         11        15              17              15            20
+  if(pid == 0){
+    for(p = ptable.proc; p <= &ptable.proc[NPROC]; p++){
+      enum procstate pstate = p->state;
+      if(pstate >=1 && pstate <= 5 && p->vrunIndex==0){
+        cprintf("%s", p->name); padding2(10, p->name);
+        cprintf("%d", p->pid); padding1(10, p->pid);
+        cprintf("%s", states[pstate]); padding2(11, states[pstate]);
+        cprintf("%d", p->nice); padding1(15, p->nice);
+        cprintf("%d", p->runtime / p->weight); padding1(17, p->runtime / p->weight);
+        cprintf("%d", p->runtime); padding1(15, p->runtime);
+        cprintf("%d", p->vruntime); padding1(20, p->vruntime); cprintf("\n");
+      }
+      else if(pstate >=1 && pstate <=5 && p->vrunIndex!=0){
+        cprintf("%s", p->name); padding2(10, p->name);
+        cprintf("%d", p->pid); padding1(10, p->pid);
+        cprintf("%s", states[pstate]); padding2(11, states[pstate]);
+        cprintf("%d", p->nice); padding1(15, p->nice);
+        cprintf("%d", p->runtime / p->weight); padding1(17, p->runtime / p->weight);
+        cprintf("%d", p->runtime); padding1(15, p->runtime);
+        padding3(20, p); cprintf("\n");
+      }
+    }
+  }
+  else{
+    for(p = ptable.proc; p <= &ptable.proc[NPROC]; p++){
+      enum procstate pstate = p->state;
+      if(p->pid == pid){
+        if(pstate >=1 && pstate <= 5 && p->vrunIndex==0){
+          cprintf("%s", p->name); padding2(10, p->name);
+          cprintf("%d", p->pid); padding1(10, p->pid);
+          cprintf("%s", states[pstate]); padding2(11, states[pstate]);
+          cprintf("%d", p->nice); padding1(15, p->nice);
+          cprintf("%d", p->runtime / p->weight); padding1(17, p->runtime / p->weight);
+          cprintf("%d", p->runtime); padding1(15, p->runtime);
+          cprintf("%d", p->vruntime); padding1(20, p->vruntime); cprintf("\n");
+        }
+        else if(pstate >=1 && pstate <=5 && p->vrunIndex!=0){
+          cprintf("%s", p->name); padding2(10, p->name);
+          cprintf("%d", p->pid); padding1(10, p->pid);
+          cprintf("%s", states[pstate]); padding2(11, states[pstate]);
+          cprintf("%d", p->nice); padding1(15, p->nice);
+          cprintf("%d", p->runtime / p->weight); padding1(17, p->runtime / p->weight);
+          cprintf("%d", p->runtime); padding1(15, p->runtime);
+          padding3(20, p); cprintf("\n");
+        }
+      }
+    }
+  }
+  release(&ptable.lock);
 }
